@@ -32,7 +32,7 @@ impl Downloader {
         filename: Option<&str>,
         known_hash: Option<&[u8]>,
         progress_bar: bool,
-    ) -> Result<()> {
+    ) -> Result<PathBuf> {
         let rt = tokio::runtime::Runtime::new()
             .context("Failed to create Tokio runtime")?;
         rt.block_on(self.retrieve_async(url, filename, known_hash, progress_bar))
@@ -46,7 +46,7 @@ impl Downloader {
         filename: Option<&str>,
         known_hash: Option<&[u8]>,
         progress_bar: bool,
-    ) -> Result<()> {
+    ) -> Result<PathBuf> {
         let file_path = if let Some(name) = filename {
             self.cache_location(name)
         } else {
@@ -79,7 +79,7 @@ impl Downloader {
             }
 
             let mut stream = response.bytes_stream();
-            let mut file = tokio::fs::File::create(file_path).await?;
+            let mut file = tokio::fs::File::create(&file_path).await?;
 
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
@@ -100,7 +100,7 @@ impl Downloader {
             }
         }
 
-        Ok(())
+        Ok(file_path)
     }
 
     fn cache_location(&self, filename: &str) -> PathBuf {
