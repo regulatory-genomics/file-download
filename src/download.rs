@@ -1,4 +1,6 @@
-use std::{fs::File, io::{BufReader, Read}, path::{Path, PathBuf}};
+use std::{fs::File, io::{BufReader, Read, Write}, path::{Path, PathBuf}};
+use std::time::{SystemTime, UNIX_EPOCH};
+use flate2::read::GzDecoder;
 use indicatif::{ProgressBar, ProgressStyle};
 use platform_dirs::AppDirs;
 use reqwest::Client;
@@ -11,6 +13,17 @@ pub struct Downloader {
     cache_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decompression {
+    Gzip,
+    Zstd,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Extraction {
+    Tar,
+}
+
 impl Downloader {
     /// Creates a new `Downloader` with the specified cache directory.
     pub fn new(cache_dir: Option<impl Into<PathBuf>>) -> Result<Self> {
@@ -21,7 +34,11 @@ impl Downloader {
             }
             dir
         } else {
-            AppDirs::new(Some("file-download-rs"), true).unwrap().cache_dir
+            let dir = AppDirs::new(Some("file-download-rs"), true).unwrap().cache_dir;
+            if !dir.exists() {
+                std::fs::create_dir_all(&dir).with_context(|| format!("Failed to create cache directory"))?;
+            }
+            dir
         };
         Ok(Self { cache_dir })
     }
@@ -32,10 +49,11 @@ impl Downloader {
         filename: Option<&str>,
         known_hash: Option<&[u8]>,
         progress_bar: bool,
+        decompression: Option<Decompression>,
     ) -> Result<PathBuf> {
         let rt = tokio::runtime::Runtime::new()
             .context("Failed to create Tokio runtime")?;
-        rt.block_on(self.retrieve_async(url, filename, known_hash, progress_bar))
+        rt.block_on(self.retrieve_async(url, filename, known_hash, progress_bar, decompression))
             .context("Failed to download file asynchronously")
     }
 
@@ -46,6 +64,7 @@ impl Downloader {
         filename: Option<&str>,
         known_hash: Option<&[u8]>,
         progress_bar: bool,
+        decompression: Option<Decompression>,
     ) -> Result<PathBuf> {
         let file_path = if let Some(name) = filename {
             self.cache_location(name)
@@ -79,7 +98,11 @@ impl Downloader {
             }
 
             let mut stream = response.bytes_stream();
-            let mut file = tokio::fs::File::create(&file_path).await?;
+            let partial_path = file_path.with_extension(format!(
+                "{}.part",
+                file_path.extension().and_then(|x| x.to_str()).unwrap_or("download")
+            ));
+            let mut file = tokio::fs::File::create(&partial_path).await?;
 
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
@@ -91,20 +114,131 @@ impl Downloader {
                 }
             }
             
+            file.flush().await?;
             if let Some(hash) = known_hash {
-                assert_eq!(
-                    digest.finalize().as_slice(),
-                    hash,
-                    "Downloaded file hash does not match expected hash"
-                );
+                if digest.finalize().as_slice() != hash {
+                    let _ = tokio::fs::remove_file(&partial_path).await;
+                    bail!("Downloaded file hash does not match expected hash");
+                }
             }
+            tokio::fs::rename(&partial_path, &file_path).await?;
         }
 
-        Ok(file_path)
+        match decompression {
+            None => Ok(file_path),
+            Some(kind) => self.decompress_cached(&file_path, kind),
+        }
+    }
+
+    pub fn retrieve_with_extraction(
+        &self,
+        url: &str,
+        filename: Option<&str>,
+        known_hash: Option<&[u8]>,
+        progress_bar: bool,
+        decompression: Option<Decompression>,
+        extraction: Option<Extraction>,
+    ) -> Result<Vec<PathBuf>> {
+        let source = self.retrieve(url, filename, known_hash, progress_bar, decompression)?;
+        match extraction {
+            None => Ok(vec![source]),
+            Some(Extraction::Tar) => self.extract_tar_cached(&source),
+        }
     }
 
     fn cache_location(&self, filename: &str) -> PathBuf {
         self.cache_dir.join(filename)
+    }
+
+    fn decompress_cached(&self, source: &Path, kind: Decompression) -> Result<PathBuf> {
+        let output = decompressed_path(source, kind);
+        if output.exists() {
+            return Ok(output);
+        }
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temporary = output.with_extension(format!(
+            "{}.{}.part",
+            output.extension().and_then(|x| x.to_str()).unwrap_or("file"),
+            suffix
+        ));
+
+        let result = (|| -> Result<()> {
+            let input = File::open(source)?;
+            let mut reader: Box<dyn Read> = match kind {
+                Decompression::Gzip => Box::new(GzDecoder::new(input)),
+                Decompression::Zstd => Box::new(zstd::stream::read::Decoder::new(input)?),
+            };
+            let mut output_file = File::create(&temporary)?;
+            std::io::copy(&mut reader, &mut output_file)?;
+            output_file.flush()?;
+            output_file.sync_all()?;
+            std::fs::rename(&temporary, &output)?;
+            Ok(())
+        })();
+
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result.map(|_| output)
+    }
+
+    fn extract_tar_cached(&self, source: &Path) -> Result<Vec<PathBuf>> {
+        let directory = source.with_extension("tar.extract");
+        if directory.exists() {
+            return collect_files(&directory);
+        }
+        let temporary = source.with_extension("tar.extract.part");
+        if temporary.exists() {
+            std::fs::remove_dir_all(&temporary)?;
+        }
+        std::fs::create_dir_all(&temporary)?;
+        let result = (|| -> Result<()> {
+            let input = File::open(source)?;
+            let mut archive = tar::Archive::new(input);
+            archive.unpack(&temporary)?;
+            std::fs::rename(&temporary, &directory)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&temporary);
+        }
+        result.and_then(|_| collect_files(&directory))
+    }
+}
+
+fn collect_files(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            files.extend(collect_files(&path)?);
+        } else {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn decompressed_path(source: &Path, kind: Decompression) -> PathBuf {
+    let expected_suffix = match kind {
+        Decompression::Gzip => "gz",
+        Decompression::Zstd => "zst",
+    };
+    if source.extension().and_then(|x| x.to_str()) == Some(expected_suffix)
+        || (kind == Decompression::Zstd
+            && source.extension().and_then(|x| x.to_str()) == Some("zstd"))
+    {
+        source.with_extension("")
+    } else {
+        source.with_file_name(format!(
+            "{}.decompressed",
+            source.file_name().unwrap().to_string_lossy()
+        ))
     }
 }
 
@@ -194,6 +328,6 @@ mod tests {
         let hash = hex!("400dd60ca61dc8388aa0942b42c95920aad7f6bedf5324005cee7e84bcf5b6d0");
         let temp_dir = tempdir().unwrap();
         let downloader = Downloader::new(Some(temp_dir.path())).unwrap();
-        downloader.retrieve(url, None, Some(&hash), false).unwrap();
+        downloader.retrieve(url, None, Some(&hash), false, None).unwrap();
     }
 }
